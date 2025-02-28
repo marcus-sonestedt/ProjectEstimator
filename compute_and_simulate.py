@@ -52,9 +52,7 @@ class Task:
         p_values = []
         
         # Process the O, L, P buckets to create weighted arrays of values
-        for est_type, buckets in [('O', self.estimations['O']), ('L', self.estimations['L']), ('P', self.estimations['P'])]:
-            values_array = []
-            
+        for est_type, buckets in [('O', self.estimations['O']), ('L', self.estimations['L']), ('P', self.estimations['P'])]:            
             # For each bucket, parse the range and extract values
             for bucket_key, count in buckets.items():
                 # Handle the case where the bucket_key is a single integer
