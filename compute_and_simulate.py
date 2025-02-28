@@ -7,7 +7,7 @@ from scipy.optimize import minimize
 
 # Parameters
 days = 100
-percentages = { 'O': 0.30, 'L':0.50, 'P':0.95}
+percentages = { 'O': 0.25, 'L':0.50, 'P':0.95}
 num_simulations = 250
 
 def bucketify(s:str):
