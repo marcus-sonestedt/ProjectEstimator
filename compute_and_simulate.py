@@ -28,18 +28,13 @@ def bucketify(s:str):
         raise
 
 class Task:
-    def __init__(self, name, o_est, l_est, p_est):
+    def __init__(self, name, o_est, l_est, p_est, availability=0.8, confidence=0.8):
         self.name = name
-        self.estimations = {'O':bucketify(o_est),'L':bucketify(l_est),'P':bucketify(p_est)}
-
-        # Extract the median values from each estimate
-        self.o_value = int(o_est.split()[0]) if isinstance(o_est, str) else int(o_est)
-        self.l_value = int(l_est.split()[0]) if isinstance(l_est, str) else int(l_est)
-        self.p_value = int(p_est.split()[0]) if isinstance(p_est, str) else int(p_est)
-
-        # Simple check 
-        if self.o_value > self.l_value or self.l_value > self.p_value:
-            print(f"Warning for task '{self.name}': OLP values should be non-decreasing (O={self.o_value}, L={self.l_value}, P={self.p_value})")        
+        self.availability = max(0.1, min(1.0, availability))  # Clamp between 0.1 and 1.0
+        self.confidence = max(0.1, min(0.95, confidence))     # Clamp between 0.1 and 0.95
+        
+        # Store raw estimations
+        self.estimations = {'O': bucketify(o_est), 'L': bucketify(l_est), 'P': bucketify(p_est)}
         
         # Fit gamma distribution parameters
         self.compute_gamma_params()
@@ -111,17 +106,32 @@ class Task:
             weighted_mean = (self.o_value + 4*self.l_value + self.p_value) / 6
             weighted_variance = ((self.p_value - self.o_value) / 6)**2
         
-        # Rest of the method remains similar, but use weighted_mean and weighted_variance
-        if weighted_variance < 0.001:
+        # Apply availability adjustment - increase duration by inverse of availability
+        availability_factor = 1.0 / self.availability
+        adjusted_mean = weighted_mean * availability_factor
+        adjusted_variance = weighted_variance * (availability_factor ** 2)
+        
+        # Apply confidence adjustment - lower confidence means wider spread
+        # Scale the variance based on confidence level (confidence of 1.0 = no change, lower = higher variance)
+        confidence_factor = 1.0 + (1.0 - self.confidence) * 2.0  # Scale factor ranges from 1.0 to 3.0
+        final_variance = adjusted_variance * confidence_factor
+        
+        # Also adjust the O, L, P values
+        self.o_value *= availability_factor
+        self.l_value *= availability_factor
+        self.p_value *= availability_factor
+        
+        # Rest of the method remains similar, but use adjusted_mean and final_variance
+        if final_variance < 0.001:
             # If variance is essentially zero, use a very narrow distribution
             self.gamma_alpha = 100.0  # High alpha for narrow distribution
-            self.gamma_beta = 100.0 / weighted_mean if weighted_mean > 0 else 100.0
+            self.gamma_beta = 100.0 / adjusted_mean if adjusted_mean > 0 else 100.0
             return
         
         # Calculate initial guess parameters for gamma distribution
         # alpha = shape, beta = rate (1/scale)
-        alpha_guess = (weighted_mean**2) / weighted_variance
-        beta_guess = weighted_mean / weighted_variance
+        alpha_guess = (adjusted_mean**2) / final_variance
+        beta_guess = adjusted_mean / final_variance
         
         # Define the objective function to minimize
         def objective(params):
@@ -153,8 +163,8 @@ class Task:
                 
         except Exception as e:
             # Fallback if optimization fails completely
-            self.gamma_alpha = max(0.1, (weighted_mean**2) / weighted_variance if weighted_variance > 0.001 else 100.0)
-            self.gamma_beta = max(0.1, weighted_mean / weighted_variance if weighted_variance > 0.001 else 100.0 / weighted_mean if weighted_mean > 0 else 100.0)
+            self.gamma_alpha = max(0.1, (adjusted_mean**2) / final_variance if final_variance > 0.001 else 100.0)
+            self.gamma_beta = max(0.1, adjusted_mean / final_variance if final_variance > 0.001 else 100.0 / adjusted_mean if adjusted_mean > 0 else 100.0)
             print(f"Warning: Error fitting distribution for task '{self.name}': {e}")
 
     def sample_duration(self, size=1):
@@ -165,6 +175,9 @@ class Task:
         return f'{self.name} {self.o_value} {self.l_value} {self.p_value}'
     
 class TaskCompletionEstimator:
+    default_availability = 0.8
+    default_confidence = 0.8
+
     def __init__(self):
         self.tasks = []
         
@@ -180,7 +193,28 @@ class TaskCompletionEstimator:
             # In read-only mode, we need to convert to list to filter properly
             rows = list(sheet.iter_rows(values_only=True))
             self.rows = [row for row in rows if row[2] is not None][4:]
-            self.tasks = [Task(name=row[1], o_est=row[2], l_est=row[3], p_est=row[4]) for row in self.rows]
+            
+            # Create tasks with availability and confidence if columns exist, otherwise use defaults
+            self.tasks = []
+            for row in self.rows:
+                name = row[1]
+                o_est = row[2]
+                l_est = row[3]
+                p_est = row[4]
+                
+                # Check if availability and confidence columns exist (column indices 5 and 6)
+                availability = row[5] if len(row) > 5 and row[5] is not None and isinstance(row[5], (int, float)) else self.default_availability
+                confidence = row[6] if len(row) > 6 and row[6] is not None and isinstance(row[6], (int, float)) else self.default_confidence
+                
+                # Create task with all parameters
+                self.tasks.append(Task(
+                    name=name, 
+                    o_est=o_est, 
+                    l_est=l_est, 
+                    p_est=p_est,
+                    availability=availability,
+                    confidence=confidence
+                ))
         
         except Exception as e:
             print(f"Error reading Excel file: {e}")
