@@ -7,34 +7,124 @@ from scipy.optimize import minimize
 
 # Parameters
 days = 100
-percentages = { 'O': 0.30, 'L':0.50, 'P':0.90}
+percentages = { 'O': 0.30, 'L':0.50, 'P':0.95}
 num_simulations = 250
 
 def bucketify(s:str):
-    votes = [int(v) for v in s.split(' ')]
-    histogram, bin_edges = np.histogram(votes, bins='auto')
-    buckets = {}
-    for i, count in enumerate(histogram):
-        bucket_key = f"{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}"
-        buckets[bucket_key] = int(count)
-    
-    return buckets
+    try:
+        if isinstance(s, int):
+            return {s:1}
+
+        votes = [int(v) for v in s.strip().split(' ')]
+        histogram, bin_edges = np.histogram(votes, bins='auto')
+        buckets = {}
+        for i, count in enumerate(histogram):
+            bucket_key = f"{bin_edges[i]:.1f}-{bin_edges[i+1]:.1f}"
+            buckets[bucket_key] = int(count)
+        
+        return buckets
+    except Exception as e:
+        print(f"Error parsing votes '{s}': {e}")
+        raise
 
 class Task:
-    def __init__(self, name, o, l, p):
+    def __init__(self, name, o_est, l_est, p_est):
         self.name = name
-        self.estimations = {'O':bucketify(o),'L':bucketify(l),'P':bucketify(p)}
+        self.estimations = {'O':bucketify(o_est),'L':bucketify(l_est),'P':bucketify(p_est)}
 
         # Extract the median values from each estimate
-        self.o_value = int(o.split()[0]) if isinstance(o, str) else int(o)
-        self.l_value = int(l.split()[0]) if isinstance(l, str) else int(l)
-        self.p_value = int(p.split()[0]) if isinstance(p, str) else int(p)
+        self.o_value = int(o_est.split()[0]) if isinstance(o_est, str) else int(o_est)
+        self.l_value = int(l_est.split()[0]) if isinstance(l_est, str) else int(l_est)
+        self.p_value = int(p_est.split()[0]) if isinstance(p_est, str) else int(p_est)
+
+        # Simple check 
+        if self.o_value > self.l_value or self.l_value > self.p_value:
+            print(f"Warning for task '{self.name}': OLP values should be non-decreasing (O={self.o_value}, L={self.l_value}, P={self.p_value})")        
         
         # Fit gamma distribution parameters
         self.compute_gamma_params()
     
     def compute_gamma_params(self):
-        """Compute gamma distribution parameters based on O, L, P values"""
+        """Compute gamma distribution parameters based on full distribution of O, L, P values"""
+        # Extract all vote values and their weights from the buckets
+        o_values = []
+        l_values = []
+        p_values = []
+        
+        # Process the O, L, P buckets to create weighted arrays of values
+        for est_type, buckets in [('O', self.estimations['O']), ('L', self.estimations['L']), ('P', self.estimations['P'])]:
+            values_array = []
+            
+            # For each bucket, parse the range and extract values
+            for bucket_key, count in buckets.items():
+                # Handle the case where the bucket_key is a single integer
+                if isinstance(bucket_key, int):
+                    bucket_value = bucket_key
+                else:
+                    # Parse range like "10.0-15.0" to get midpoint
+                    try:
+                        low, high = bucket_key.split('-')
+                        bucket_value = (float(low) + float(high)) / 2
+                    except ValueError:
+                        # If parsing fails, use first number in the string
+                        bucket_value = float(bucket_key.split('-')[0])
+                
+                # Add values to the appropriate array with weights
+                if est_type == 'O':
+                    o_values.extend([bucket_value] * count)
+                elif est_type == 'L':
+                    l_values.extend([bucket_value] * count)
+                else:  # 'P'
+                    p_values.extend([bucket_value] * count)
+        
+        # Calculate percentiles from actual distributions
+        if o_values and l_values and p_values:
+            # Sort the arrays
+            o_values.sort()
+            l_values.sort()
+            p_values.sort()
+            
+            # Get representative values at the specified percentiles
+            o_percentile_idx = min(int(len(o_values) * percentages['O']), len(o_values) - 1)
+            l_percentile_idx = min(int(len(l_values) * percentages['L']), len(l_values) - 1) 
+            p_percentile_idx = min(int(len(p_values) * percentages['P']), len(p_values) - 1)
+            
+            # Use these as target values for gamma distribution fitting
+            o_target = o_values[o_percentile_idx]
+            l_target = l_values[l_percentile_idx]
+            p_target = p_values[p_percentile_idx]
+            
+            # Store these for later use (they're more accurate than single values)
+            self.o_value = o_target
+            self.l_value = l_target
+            self.p_value = p_target
+        else:
+            # Fall back to the first values if buckets are empty
+            print(f"Warning: Insufficient vote data for task '{self.name}', using first values")
+            # o_value, l_value, and p_value were already set in __init__
+        
+        # Calculate mean and variance using the full distribution
+        all_values = o_values + l_values + p_values
+        if all_values:
+            weighted_mean = np.mean(all_values)
+            weighted_variance = np.var(all_values)
+        else:
+            # Fall back to PERT formula if no values are available
+            weighted_mean = (self.o_value + 4*self.l_value + self.p_value) / 6
+            weighted_variance = ((self.p_value - self.o_value) / 6)**2
+        
+        # Rest of the method remains similar, but use weighted_mean and weighted_variance
+        if weighted_variance < 0.001:
+            # If variance is essentially zero, use a very narrow distribution
+            self.gamma_alpha = 100.0  # High alpha for narrow distribution
+            self.gamma_beta = 100.0 / weighted_mean if weighted_mean > 0 else 100.0
+            return
+        
+        # Calculate initial guess parameters for gamma distribution
+        # alpha = shape, beta = rate (1/scale)
+        alpha_guess = (weighted_mean**2) / weighted_variance
+        beta_guess = weighted_mean / weighted_variance
+        
         # Define the objective function to minimize
         def objective(params):
             alpha, beta = params
@@ -42,23 +132,7 @@ class Task:
             o_error = (gamma.ppf(percentages['O'], alpha, scale=1/beta) - self.o_value)**2
             l_error = (gamma.ppf(percentages['L'], alpha, scale=1/beta) - self.l_value)**2
             p_error = (gamma.ppf(percentages['P'], alpha, scale=1/beta) - self.p_value)**2
-            return o_error + p_error + l_error
-        
-        # Initial guess based on PERT formula
-        mean = (self.o_value + 4*self.l_value + self.p_value) / 6
-        variance = ((self.p_value - self.o_value) / 6)**2
-        
-        # Handle edge cases where all estimates are identical or very close
-        if variance < 0.001:
-            # If variance is essentially zero, use a very narrow distribution
-            self.gamma_alpha = 100.0  # High alpha for narrow distribution
-            self.gamma_beta = 100.0 / mean if mean > 0 else 100.0
-            return
-        
-        # Calculate initial guess parameters for gamma distribution
-        # alpha = shape, beta = rate (1/scale)
-        alpha_guess = (mean**2) / variance
-        beta_guess = mean / variance
+            return o_error + l_error + p_error
         
         # Ensure initial guesses are positive and reasonable
         initial_guess = [max(0.1, alpha_guess), max(0.1, beta_guess)]
@@ -74,15 +148,15 @@ class Task:
                 self.gamma_alpha = max(0.1, self.gamma_alpha)
                 self.gamma_beta = max(0.1, self.gamma_beta)
             else:
-                # If optimization doesn't converge, fall back to PERT-based estimate
+                # If optimization doesn't converge, fall back to initial guess
                 self.gamma_alpha = max(0.1, alpha_guess)
                 self.gamma_beta = max(0.1, beta_guess)
                 print(f"Warning: Optimization failed for task '{self.name}', using fallback parameters")
                 
         except Exception as e:
             # Fallback if optimization fails completely
-            self.gamma_alpha = max(0.1, (mean**2) / variance if variance > 0.001 else 100.0)
-            self.gamma_beta = max(0.1, mean / variance if variance > 0.001 else 100.0 / mean if mean > 0 else 100.0)
+            self.gamma_alpha = max(0.1, (weighted_mean**2) / weighted_variance if weighted_variance > 0.001 else 100.0)
+            self.gamma_beta = max(0.1, weighted_mean / weighted_variance if weighted_variance > 0.001 else 100.0 / weighted_mean if weighted_mean > 0 else 100.0)
             print(f"Warning: Error fitting distribution for task '{self.name}': {e}")
 
     def sample_duration(self, size=1):
@@ -108,7 +182,7 @@ class TaskCompletionEstimator:
             # In read-only mode, we need to convert to list to filter properly
             rows = list(sheet.iter_rows(values_only=True))
             self.rows = [row for row in rows if row[2] is not None][4:]
-            self.tasks = [Task(name=row[1], o=row[2], l=row[3], p=row[4]) for row in self.rows]
+            self.tasks = [Task(name=row[1], o_est=row[2], l_est=row[3], p_est=row[4]) for row in self.rows]
         
         except Exception as e:
             print(f"Error reading Excel file: {e}")
